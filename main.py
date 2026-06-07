@@ -40,7 +40,7 @@ tf.config.optimizer.set_jit(True)
 # CONFIG
 # ============================================================
 
-DATA_DIR = "/kaggle/input/YOUR_DATASET_FOLDER"   # <-- CHANGE THIS
+DATA_DIR = "/kaggle/input/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
 
 IMG_SIZE = 128
 BATCH_SIZE = 16          # Use 8 if RAM/GPU memory crashes

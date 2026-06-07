@@ -25,8 +25,8 @@ IMG_SIZE    = 128        # 128×128 keeps VRAM well under 16 GB; use 256 if desi
 WATERMARK_BITS = 64      # binary copyright message length
 
 # ── data ─────────────────────────────────────────────────────────────────────
-DATA_DIR    = '/kaggle/input/div2k/DIV2K_train_HR'   # adjust if your dataset path differs
-VAL_DIR     = '/kaggle/input/div2k/DIV2K_valid_HR'
+DATA_DIR = "/kaggle/input/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
+DATA_DIR = "/kaggle/input/div2k-high-resolution-images/DIV2K_valid_HR/DIV2K_valid_HR"
 NUM_TRAIN   = 800        # DIV2K train set size
 NUM_VAL     = 100        # DIV2K val set size
 
