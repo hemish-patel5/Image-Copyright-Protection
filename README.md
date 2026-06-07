@@ -57,4 +57,3 @@ The framework is evaluated using a combination of image quality and watermark re
 * Zhu, J., et al. (2018). HiDDeN: Hiding data with deep networks.
 
 ---
-*This project is based on a research report titled "Image Copyright Protection Using Transformer-Based Invisible Watermarking".*
