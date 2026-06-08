@@ -1,6 +1,5 @@
 # ============================================================
-# Image Copyright Protection Using Transformer Watermarking
-# Kaggle T4 / RAM-safe starter implementation
+# STABLE SETUP FOR DEBUGGING
 # ============================================================
 
 import os
@@ -15,17 +14,19 @@ from tensorflow.keras import layers
 print("TensorFlow:", tf.__version__)
 print("GPUs:", tf.config.list_physical_devices("GPU"))
 
-# Reproducibility
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# Mixed precision for T4 GPU
+# Use float32 first for stability
 from tensorflow.keras import mixed_precision
-mixed_precision.set_global_policy("mixed_float16")
+mixed_precision.set_global_policy("float32")
 
-# Avoid TensorFlow taking all GPU memory at once
+# Disable XLA/JIT
+tf.config.optimizer.set_jit(False)
+
+# GPU memory growth
 gpus = tf.config.list_physical_devices("GPU")
 for gpu in gpus:
     try:
@@ -33,54 +34,66 @@ for gpu in gpus:
     except:
         pass
 
-# Optional speed-up
-tf.config.optimizer.set_jit(True)
+print("Policy:", mixed_precision.global_policy())
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-DATA_DIR = "/kaggle/input/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
-
-IMG_SIZE = 128
-BATCH_SIZE = 16          # Use 8 if RAM/GPU memory crashes
-WM_BITS = 32             # 32-bit copyright ID
-EPOCHS = 30
+DATA_DIR = "/kaggle/input/datasets/soumikrakshit/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
+IMG_SIZE = 96
+BATCH_SIZE = 8          # Use 8 if RAM/GPU memory crashes
+WM_BITS = 16             # 32-bit copyright ID
+EPOCHS = 15
 
 TRAIN_SPLIT = 0.9
 AUTOTUNE = tf.data.AUTOTUNE
 
 # Loss weights
-IMAGE_LOSS_WEIGHT = 1.0
-WATERMARK_LOSS_WEIGHT = 5.0
-RESIDUAL_LOSS_WEIGHT = 0.2
+IMAGE_LOSS_WEIGHT = 0.2
+WATERMARK_LOSS_WEIGHT = 30.0
+RESIDUAL_LOSS_WEIGHT = 0.01
 
 # Watermark strength: lower = more invisible, higher = easier extraction
-MAX_RESIDUAL_STRENGTH = 0.08
+MAX_RESIDUAL_STRENGTH = 0.10
 
 print("Image size:", IMG_SIZE)
 print("Batch size:", BATCH_SIZE)
 print("Watermark bits:", WM_BITS)
 
 # ============================================================
-# FIND IMAGE FILES
+# TRAIN AND VALIDATION DATASET PATHS
 # ============================================================
+
+TRAIN_DIR = "/kaggle/input/datasets/soumikrakshit/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
+VAL_DIR = "/kaggle/input/datasets/soumikrakshit/div2k-high-resolution-images/DIV2K_valid_HR/DIV2K_valid_HR"
 
 valid_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
-image_paths = []
-for root, dirs, files in os.walk(DATA_DIR):
-    for file in files:
-        if file.lower().endswith(valid_exts):
-            image_paths.append(os.path.join(root, file))
+def get_image_paths(folder):
+    paths = []
+    for root, dirs, files in os.walk(folder):
+        for file in files:
+            if file.lower().endswith(valid_exts):
+                paths.append(os.path.join(root, file))
+    return paths
 
-random.shuffle(image_paths)
+train_paths = get_image_paths(TRAIN_DIR)
+val_paths = get_image_paths(VAL_DIR)
 
-print("Total images found:", len(image_paths))
-print("Example path:", image_paths[0] if image_paths else "No images found")
+random.shuffle(train_paths)
+random.shuffle(val_paths)
 
-if len(image_paths) == 0:
-    raise ValueError("No image files found. Check DATA_DIR.")
+print("Training images:", len(train_paths))
+print("Validation images:", len(val_paths))
+print("Example train image:", train_paths[0])
+print("Example val image:", val_paths[0])
+
+if len(train_paths) == 0:
+    raise ValueError("No training images found. Check TRAIN_DIR.")
+
+if len(val_paths) == 0:
+    raise ValueError("No validation images found. Check VAL_DIR.")
 
 # ============================================================
 # TF.DATA PIPELINE
@@ -93,11 +106,6 @@ def load_image(path):
     img = tf.cast(img, tf.float32) / 255.0
     img.set_shape([IMG_SIZE, IMG_SIZE, 3])
     return img
-
-num_train = int(len(image_paths) * TRAIN_SPLIT)
-
-train_paths = image_paths[:num_train]
-val_paths = image_paths[num_train:]
 
 train_ds = (
     tf.data.Dataset.from_tensor_slices(train_paths)
@@ -118,84 +126,45 @@ print("Training images:", len(train_paths))
 print("Validation images:", len(val_paths))
 
 # ============================================================
-# TF.DATA PIPELINE
+# LIGHTWEIGHT TRANSFORMER BLOCK
 # ============================================================
 
-def load_image(path):
-    img_bytes = tf.io.read_file(path)
-    img = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
-    img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
-    img = tf.cast(img, tf.float32) / 255.0
-    img.set_shape([IMG_SIZE, IMG_SIZE, 3])
-    return img
+class TransformerBlock(layers.Layer):
+    def __init__(self, dim, num_heads=4, mlp_ratio=2.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.attn = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=dim // num_heads,
+            dropout=dropout
+        )
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
 
-num_train = int(len(image_paths) * TRAIN_SPLIT)
+        self.mlp = keras.Sequential([
+            layers.Dense(int(dim * mlp_ratio), activation="gelu"),
+            layers.Dropout(dropout),
+            layers.Dense(dim),
+            layers.Dropout(dropout)
+        ])
 
-train_paths = image_paths[:num_train]
-val_paths = image_paths[num_train:]
+    def call(self, x, training=False):
+        attn_out = self.attn(self.norm1(x), self.norm1(x), training=training)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x), training=training)
+        return x
 
-train_ds = (
-    tf.data.Dataset.from_tensor_slices(train_paths)
-    .shuffle(min(len(train_paths), 2000), seed=SEED)
-    .map(load_image, num_parallel_calls=AUTOTUNE)
-    .batch(BATCH_SIZE)
-    .prefetch(AUTOTUNE)
-)
-
-val_ds = (
-    tf.data.Dataset.from_tensor_slices(val_paths)
-    .map(load_image, num_parallel_calls=AUTOTUNE)
-    .batch(BATCH_SIZE)
-    .prefetch(AUTOTUNE)
-)
-
-print("Training images:", len(train_paths))
-print("Validation images:", len(val_paths))
-
-# ============================================================
-# ATTACK LAYER
+# ====================================================
+# Attack
 # ============================================================
 
 class AttackLayer(layers.Layer):
-    def __init__(self, img_size=128):
+    def __init__(self, img_size=96):
         super().__init__()
         self.img_size = img_size
 
-    def gaussian_blur(self, x):
-        # Simple 3x3 average blur, depthwise per channel
-        kernel = tf.ones((3, 3, 3, 1), dtype=x.dtype) / 9.0
-        return tf.nn.depthwise_conv2d(x, kernel, strides=[1, 1, 1, 1], padding="SAME")
-
     def call(self, x, training=False):
-        if not training:
-            return x
+        return tf.clip_by_value(tf.cast(x, tf.float32), 0.0, 1.0)
 
-        x = tf.cast(x, tf.float32)
-
-        # Random Gaussian noise
-        if tf.random.uniform([]) < 0.50:
-            noise = tf.random.normal(tf.shape(x), mean=0.0, stddev=0.025)
-            x = x + noise
-
-        # Random brightness/contrast
-        if tf.random.uniform([]) < 0.35:
-            x = tf.image.random_brightness(x, max_delta=0.05)
-            x = tf.image.random_contrast(x, lower=0.9, upper=1.1)
-
-        # Random blur
-        if tf.random.uniform([]) < 0.35:
-            x = self.gaussian_blur(x)
-
-        # Random crop and resize
-        if tf.random.uniform([]) < 0.50:
-            crop_ratio = tf.random.uniform([], 0.82, 1.0)
-            crop_size = tf.cast(tf.cast(self.img_size, tf.float32) * crop_ratio, tf.int32)
-            x = tf.image.resize_with_crop_or_pad(x, crop_size, crop_size)
-            x = tf.image.resize(x, [self.img_size, self.img_size])
-
-        x = tf.clip_by_value(x, 0.0, 1.0)
-        return x
-    
 # ============================================================
 # WATERMARK EMBEDDING MODEL
 # ============================================================
@@ -282,7 +251,8 @@ decoder = build_watermark_decoder(IMG_SIZE, WM_BITS)
 decoder.summary()
 
 # ============================================================
-# TRAINER MODEL
+# FIXED TRAINER MODEL
+# Mixed-precision safe version
 # ============================================================
 
 class WatermarkTrainer(keras.Model):
@@ -298,7 +268,9 @@ class WatermarkTrainer(keras.Model):
         self.total_loss_tracker = keras.metrics.Mean(name="loss")
         self.image_loss_tracker = keras.metrics.Mean(name="image_loss")
         self.wm_loss_tracker = keras.metrics.Mean(name="watermark_loss")
+        self.residual_loss_tracker = keras.metrics.Mean(name="residual_loss")
         self.ber_tracker = keras.metrics.Mean(name="bit_error_rate")
+        self.acc_tracker = keras.metrics.Mean(name="extraction_accuracy")
 
     @property
     def metrics(self):
@@ -306,6 +278,7 @@ class WatermarkTrainer(keras.Model):
             self.total_loss_tracker,
             self.image_loss_tracker,
             self.wm_loss_tracker,
+            self.residual_loss_tracker,
             self.ber_tracker
         ]
 
@@ -316,26 +289,43 @@ class WatermarkTrainer(keras.Model):
         images = tf.cast(images, tf.float32)
         batch_size = tf.shape(images)[0]
 
-        # Random binary copyright watermark
         watermark = tf.cast(
-            tf.random.uniform((batch_size, WM_BITS), minval=0, maxval=2, dtype=tf.int32),
+            tf.random.uniform(
+                (batch_size, WM_BITS),
+                minval=0,
+                maxval=2,
+                dtype=tf.int32
+            ),
             tf.float32
         )
 
         with tf.GradientTape() as tape:
             watermarked, residual = self.encoder([images, watermark], training=True)
+
+            watermarked = tf.cast(watermarked, tf.float32)
+            residual = tf.cast(residual, tf.float32)
+
             attacked = self.attack_layer(watermarked, training=True)
+            attacked = tf.cast(attacked, tf.float32)
+
             logits = self.decoder(attacked, training=True)
+            logits = tf.cast(logits, tf.float32)
 
             image_loss = self.mae(images, watermarked)
             wm_loss = self.bce(watermark, logits)
             residual_loss = tf.reduce_mean(tf.abs(residual))
 
+            image_loss = tf.cast(image_loss, tf.float32)
+            wm_loss = tf.cast(wm_loss, tf.float32)
+            residual_loss = tf.cast(residual_loss, tf.float32)
+
             total_loss = (
-                IMAGE_LOSS_WEIGHT * image_loss +
-                WATERMARK_LOSS_WEIGHT * wm_loss +
-                RESIDUAL_LOSS_WEIGHT * residual_loss
+                tf.cast(IMAGE_LOSS_WEIGHT, tf.float32) * image_loss +
+                tf.cast(WATERMARK_LOSS_WEIGHT, tf.float32) * wm_loss +
+                tf.cast(RESIDUAL_LOSS_WEIGHT, tf.float32) * residual_loss
             )
+
+            total_loss = tf.cast(total_loss, tf.float32)
 
         trainable_vars = self.encoder.trainable_variables + self.decoder.trainable_variables
         grads = tape.gradient(total_loss, trainable_vars)
@@ -343,16 +333,19 @@ class WatermarkTrainer(keras.Model):
 
         pred_bits = tf.cast(tf.sigmoid(logits) > 0.5, tf.float32)
         ber = tf.reduce_mean(tf.cast(tf.not_equal(pred_bits, watermark), tf.float32))
+        ber = tf.cast(ber, tf.float32)
 
         self.total_loss_tracker.update_state(total_loss)
         self.image_loss_tracker.update_state(image_loss)
         self.wm_loss_tracker.update_state(wm_loss)
+        self.residual_loss_tracker.update_state(residual_loss)
         self.ber_tracker.update_state(ber)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "image_loss": self.image_loss_tracker.result(),
             "watermark_loss": self.wm_loss_tracker.result(),
+            "residual_loss": self.residual_loss_tracker.result(),
             "bit_error_rate": self.ber_tracker.result()
         }
 
@@ -364,36 +357,57 @@ class WatermarkTrainer(keras.Model):
         batch_size = tf.shape(images)[0]
 
         watermark = tf.cast(
-            tf.random.uniform((batch_size, WM_BITS), minval=0, maxval=2, dtype=tf.int32),
+            tf.random.uniform(
+                (batch_size, WM_BITS),
+                minval=0,
+                maxval=2,
+                dtype=tf.int32
+            ),
             tf.float32
         )
 
         watermarked, residual = self.encoder([images, watermark], training=False)
+
+        watermarked = tf.cast(watermarked, tf.float32)
+        residual = tf.cast(residual, tf.float32)
+
         attacked = self.attack_layer(watermarked, training=False)
+        attacked = tf.cast(attacked, tf.float32)
+
         logits = self.decoder(attacked, training=False)
+        logits = tf.cast(logits, tf.float32)
 
         image_loss = self.mae(images, watermarked)
         wm_loss = self.bce(watermark, logits)
         residual_loss = tf.reduce_mean(tf.abs(residual))
 
+        image_loss = tf.cast(image_loss, tf.float32)
+        wm_loss = tf.cast(wm_loss, tf.float32)
+        residual_loss = tf.cast(residual_loss, tf.float32)
+
         total_loss = (
-            IMAGE_LOSS_WEIGHT * image_loss +
-            WATERMARK_LOSS_WEIGHT * wm_loss +
-            RESIDUAL_LOSS_WEIGHT * residual_loss
+            tf.cast(IMAGE_LOSS_WEIGHT, tf.float32) * image_loss +
+            tf.cast(WATERMARK_LOSS_WEIGHT, tf.float32) * wm_loss +
+            tf.cast(RESIDUAL_LOSS_WEIGHT, tf.float32) * residual_loss
         )
+
+        total_loss = tf.cast(total_loss, tf.float32)
 
         pred_bits = tf.cast(tf.sigmoid(logits) > 0.5, tf.float32)
         ber = tf.reduce_mean(tf.cast(tf.not_equal(pred_bits, watermark), tf.float32))
+        ber = tf.cast(ber, tf.float32)
 
         self.total_loss_tracker.update_state(total_loss)
         self.image_loss_tracker.update_state(image_loss)
         self.wm_loss_tracker.update_state(wm_loss)
+        self.residual_loss_tracker.update_state(residual_loss)
         self.ber_tracker.update_state(ber)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "image_loss": self.image_loss_tracker.result(),
             "watermark_loss": self.wm_loss_tracker.result(),
+            "residual_loss": self.residual_loss_tracker.result(),
             "bit_error_rate": self.ber_tracker.result()
         }
 
@@ -413,21 +427,19 @@ optimizer = keras.optimizers.AdamW(
 
 trainer.compile(optimizer=optimizer)
 
+
 # ============================================================
 # TRAINING
 # ============================================================
 
+# ============================================================
+# CALLBACKS - SIMPLE WORKING VERSION
+# ============================================================
+
 callbacks = [
-    keras.callbacks.ModelCheckpoint(
-        "best_watermark_model.weights.h5",
-        save_weights_only=True,
-        save_best_only=True,
-        monitor="val_bit_error_rate",
-        mode="min",
-        verbose=1
-    ),
     keras.callbacks.ReduceLROnPlateau(
         monitor="val_bit_error_rate",
+        mode="min",
         factor=0.5,
         patience=3,
         min_lr=1e-6,
@@ -435,6 +447,7 @@ callbacks = [
     ),
     keras.callbacks.EarlyStopping(
         monitor="val_bit_error_rate",
+        mode="min",
         patience=7,
         restore_best_weights=True,
         verbose=1
@@ -447,6 +460,19 @@ history = trainer.fit(
     epochs=EPOCHS,
     callbacks=callbacks
 )
+
+# ===========================================
+#  Save Training 
+# ===========================================
+
+encoder.save_weights("transformer_watermark_encoder.weights.h5")
+decoder.save_weights("transformer_watermark_decoder.weights.h5")
+
+encoder.save("transformer_watermark_encoder.keras")
+decoder.save("transformer_watermark_decoder.keras")
+
+print("Saved encoder and decoder.")
+
 
 # ============================================================
 # TRAINING CURVES
@@ -467,6 +493,7 @@ plot_curve("loss")
 plot_curve("bit_error_rate")
 plot_curve("image_loss")
 plot_curve("watermark_loss")
+
 
 # ============================================================
 # VISUAL DEMO

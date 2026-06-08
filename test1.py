@@ -25,8 +25,8 @@ IMG_SIZE    = 128        # 128×128 keeps VRAM well under 16 GB; use 256 if desi
 WATERMARK_BITS = 64      # binary copyright message length
 
 # ── data ─────────────────────────────────────────────────────────────────────
-DATA_DIR = "/kaggle/input/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
-DATA_DIR = "/kaggle/input/div2k-high-resolution-images/DIV2K_valid_HR/DIV2K_valid_HR"
+DATA_DIR = "/kaggle/input/datasets/soumikrakshit/div2k-high-resolution-images/DIV2K_train_HR/DIV2K_train_HR"
+VAL_DIR = "/kaggle/input/datasets/soumikrakshit/div2k-high-resolution-images/DIV2K_valid_HR/DIV2K_valid_HR"
 NUM_TRAIN   = 800        # DIV2K train set size
 NUM_VAL     = 100        # DIV2K val set size
 
@@ -37,9 +37,9 @@ LR          = 1e-4
 GRAD_CLIP   = 1.0
 
 # ── loss weights (λ1 image, λ2 watermark, λ3 perceptual placeholder) ─────────
-LAMBDA_IMG  = 1.0
-LAMBDA_WM   = 1.5        # slightly upweight watermark recovery
-LAMBDA_PERC = 0.0        # set > 0 after initial training stabilises
+LAMBDA_IMG  = 1
+LAMBDA_WM   = 1.5       # slightly upweight watermark recovery
+LAMBDA_PERC = 0.05        # set > 0 after initial training stabilises
 
 # ── model dims (compact Transformer) ────────────────────────────────────────
 EMBED_DIM   = 64         # patch embedding channels
@@ -52,9 +52,6 @@ MLP_RATIO   = 2.0
 OUT_DIR = '/kaggle/working/outputs'
 os.makedirs(OUT_DIR, exist_ok=True)
 print('Config loaded.')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
 
 class WatermarkDataset(Dataset):
     """Returns (image_tensor, random_binary_watermark) pairs."""
@@ -106,10 +103,6 @@ val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
 
 print(f'Train: {len(train_ds)} images · Val: {len(val_ds)} images')
 print(f'Train batches: {len(train_loader)} · Val batches: {len(val_loader)}')
-
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
 
 class PatchEmbed(nn.Module):
     """Split image into non-overlapping patches and project to embed_dim."""
@@ -172,9 +165,7 @@ class PatchUnembed(nn.Module):
         B, N, C = x.shape
         x = x.transpose(1, 2).reshape(B, C, H, W)
         return self.proj(x)  # (B, out_ch, img_size, img_size)
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+
 class WatermarkEmbedder(nn.Module):
     """
     Takes (image, watermark_bits) and returns watermarked_image.
@@ -207,6 +198,8 @@ class WatermarkEmbedder(nn.Module):
         self.norm        = nn.LayerNorm(EMBED_DIM)
         self.patch_unembed = PatchUnembed(out_ch=3)
         self.out_act     = nn.Tanh()  # small residual in [-1, 1]
+        self.residual_scale  = nn.Parameter(torch.tensor(0.1))  # ← ADD THIS
+
 
     def forward(self, img, wm):
         # img: (B, 3, H, W) · wm: (B, bits)
@@ -218,18 +211,17 @@ class WatermarkEmbedder(nn.Module):
         tokens = tokens + wm_vec
 
         for blk in self.blocks:
+            tokens = tokens + wm_vec              # re-inject before every block
             tokens = blk(tokens)
-        tokens = self.norm(tokens)
 
-        residual  = self.out_act(self.patch_unembed(tokens, H, W))  # small delta
-        watermarked = torch.clamp(img + 0.1 * residual, 0.0, 1.0)  # imperceptible
+        residual    = self.out_act(self.patch_unembed(tokens, H, W))
+        # In WatermarkEmbedder.forward():
+        watermarked = torch.clamp(img + self.residual_scale.clamp(0.02, 0.12) * residual, 0.0, 1.0)
         return watermarked
 
 
 print('Embedder defined.')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+
 class WatermarkExtractor(nn.Module):
     """
     Takes a (possibly attacked) watermarked image and predicts the binary
@@ -275,9 +267,8 @@ class WatermarkExtractor(nn.Module):
 
 
 print('Extractor defined.')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+
+
 class AttackLayer(nn.Module):
     """
     Randomly applies one of: Gaussian noise · JPEG-approx blur ·
@@ -329,9 +320,6 @@ class AttackLayer(nn.Module):
 
 
 print('AttackLayer defined.')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
 embedder  = WatermarkEmbedder().to(DEVICE)
 extractor = WatermarkExtractor().to(DEVICE)
 attack    = AttackLayer(p=0.8).to(DEVICE)
@@ -342,17 +330,24 @@ def count_params(model):
 print(f'Embedder  params : {count_params(embedder):,}')
 print(f'Extractor params : {count_params(extractor):,}')
 print(f'Total params     : {count_params(embedder) + count_params(extractor):,}')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+
 # ── loss ─────────────────────────────────────────────────────────────────────
 mse_loss = nn.MSELoss()
 bce_loss = nn.BCEWithLogitsLoss()
 
+# REPLACE your total_loss function in Section 4:
+
 def total_loss(orig, watermarked, wm_true, wm_logits):
-    l_img  = mse_loss(watermarked, orig)
-    l_wm   = bce_loss(wm_logits, wm_true)
-    return LAMBDA_IMG * l_img + LAMBDA_WM * l_wm, l_img.item(), l_wm.item()
+    l_img = mse_loss(watermarked, orig)
+    l_wm  = bce_loss(wm_logits, wm_true)
+
+    # Normalise: target img_loss ~ 0.001, target wm_loss ~ 0.693
+    # Scale both to same magnitude before applying lambdas
+    l_img_scaled = l_img * 1000          # now sits in ~1.0 range
+    l_wm_scaled  = l_wm  / 0.693        # now sits in ~1.0 range (0=perfect, 1=random)
+
+    loss = LAMBDA_IMG * l_img_scaled + LAMBDA_WM * l_wm_scaled
+    return loss, l_img.item(), l_wm.item()
 
 
 # ── metrics ──────────────────────────────────────────────────────────────────
@@ -383,22 +378,18 @@ def extraction_accuracy(wm_true, wm_logits):
     return per_sample.mean().item()
 
 print('Loss functions and metrics defined.')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-params    = list(embedder.parameters()) + list(extractor.parameters())
-optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-# Mixed precision scaler (T4 supports FP16 — halves VRAM usage)
-scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
+# UPDATED Section 5 — remove optimizer, keep scheduler + scaler:
+params    = list(embedder.parameters()) + list(extractor.parameters())
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                torch.optim.AdamW(params, lr=LR, weight_decay=1e-4),  # dummy for scheduler init
+                T_max=EPOCHS, eta_min=1e-6)
+scaler    = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
 
 print(f'Optimizer  : AdamW  lr={LR}  wd=1e-4')
 print(f'Scheduler  : CosineAnnealingLR  T_max={EPOCHS}')
 print(f'AMP (FP16) : {DEVICE.type == "cuda"}')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+
 history = {'train_loss': [], 'val_loss': [], 'psnr': [],
            'ssim': [], 'ber': [], 'acc': []}
 
@@ -411,7 +402,7 @@ def train_epoch(epoch):
         imgs, wms = imgs.to(DEVICE), wms.to(DEVICE)
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+        with torch.amp.autocast('cuda', enabled=(DEVICE.type == 'cuda')):
             watermarked = embedder(imgs, wms)
             attacked    = attack(watermarked)
             wm_logits   = extractor(attacked)
@@ -439,7 +430,7 @@ def val_epoch():
     for imgs, wms in val_loader:
         imgs, wms = imgs.to(DEVICE), wms.to(DEVICE)
 
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+        with torch.amp.autocast('cuda', enabled=(DEVICE.type == 'cuda')):
             watermarked = embedder(imgs, wms)
             wm_logits   = extractor(watermarked)   # no attack at val time
             loss, _, _  = total_loss(imgs, watermarked, wms, wm_logits)
@@ -455,15 +446,43 @@ def val_epoch():
 
 
 print('Train/val loops defined.')
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
 
+# =======================================================
+# =======================================================
+# Training 
+# =======================================================
+# =======================================================
+
+PHASE1_EPOCHS = 8
 best_val_loss = float('inf')
 
 for epoch in range(1, EPOCHS + 1):
-    t0 = time.time()
 
+    # ── Phase control ────────────────────────────────────────────
+    if epoch <= PHASE1_EPOCHS:
+        for p in embedder.parameters():
+            p.requires_grad = True
+        for p in extractor.parameters():
+            p.requires_grad = False
+        if epoch == 1:
+            print('>>> Phase 1: embedder-only training (extractor frozen)')
+    else:
+        for p in embedder.parameters():
+            p.requires_grad = True
+        for p in extractor.parameters():
+            p.requires_grad = True
+        if epoch == PHASE1_EPOCHS + 1:
+            print('>>> Phase 2: joint training (all unfrozen)')
+
+    # ── Rebuild optimizer ────────────────────────────────────────
+    if epoch <= PHASE1_EPOCHS:
+        active_params = list(embedder.parameters())
+    else:
+        active_params = list(embedder.parameters()) + list(extractor.parameters())
+    optimizer = torch.optim.AdamW(active_params, lr=LR, weight_decay=1e-4)
+
+    # ── Train & validate ─────────────────────────────────────────
+    t0 = time.time()
     tr_loss, tr_img, tr_wm = train_epoch(epoch)
     vl_loss, vl_psnr, vl_ssim, vl_ber, vl_acc = val_epoch()
     scheduler.step()
@@ -484,7 +503,6 @@ for epoch in range(1, EPOCHS + 1):
           f'SSIM={vl_ssim:.4f}  BER={vl_ber:.4f}  '
           f'Acc={vl_acc:.4f}  LR={lr_now:.2e}  {elapsed:.1f}s')
 
-    # Save best checkpoint
     if vl_loss < best_val_loss:
         best_val_loss = vl_loss
         torch.save({'embedder':  embedder.state_dict(),
@@ -494,10 +512,7 @@ for epoch in range(1, EPOCHS + 1):
         print(f'  ↳ best model saved (val_loss={vl_loss:.4f})')
 
 print('\nTraining complete.')
-
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+print(f'Accuracy = {(1 - vl_ber) * 100:.2f}%')
 
 fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 
@@ -518,9 +533,6 @@ plt.tight_layout()
 plt.savefig(f'{OUT_DIR}/training_curves.png', dpi=150)
 plt.show()
 
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
 # Load best checkpoint
 ckpt = torch.load(f'{OUT_DIR}/best_model.pth', map_location=DEVICE)
 embedder.load_state_dict(ckpt['embedder'])
@@ -591,10 +603,7 @@ for atk, label in zip(ATTACK_NAMES, ATTACK_LABELS):
     print(f'{label:<22} {r["psnr"]:>10.2f} {r["ssim"]:>8.4f} '
           f'{r["ber"]:>8.4f} {r["acc"]:>8.4f}')
 
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-def visualise_demo(n_samples=4):
+    def visualise_demo(n_samples=4):
     embedder.eval(); extractor.eval()
     imgs, wms = next(iter(val_loader))
     imgs, wms = imgs[:n_samples].to(DEVICE), wms[:n_samples].to(DEVICE)
@@ -632,11 +641,7 @@ def visualise_demo(n_samples=4):
 
 
 visualise_demo()
-print('Demo saved.')
-
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
+print('Demo saved.')      
 
 torch.save({'embedder':  embedder.state_dict(),
             'extractor': extractor.state_dict(),
