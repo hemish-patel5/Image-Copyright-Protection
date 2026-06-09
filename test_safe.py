@@ -197,8 +197,11 @@ class WatermarkEmbedder(nn.Module):
         self.norm        = nn.LayerNorm(EMBED_DIM)
         self.patch_unembed = PatchUnembed(out_ch=3)
         self.out_act     = nn.Tanh()  # small residual in [-1, 1]
-        self.residual_scale = nn.Parameter(torch.tensor(0.15))  # starts at 0.3, learned
 
+
+        ###############################################################
+        self.residual_scale = nn.Parameter(torch.tensor(0.3))  # starts at 0.3, learned
+        ###############################################################
 
     def forward(self, img, wm):
         # img: (B, 3, H, W) · wm: (B, bits)
@@ -215,7 +218,7 @@ class WatermarkEmbedder(nn.Module):
             tokens = blk(tokens)
 
         residual    = self.out_act(self.patch_unembed(tokens, H, W))
-        watermarked = torch.clamp(img + self.residual_scale.clamp(0.08, 0.25) * residual, 0.0, 1.0)
+        watermarked = torch.clamp(img + self.residual_scale.clamp(0.15, 0.40) * residual, 0.0, 1.0)
         return watermarked
 
 
