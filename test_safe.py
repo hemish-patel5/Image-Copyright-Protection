@@ -32,14 +32,14 @@ NUM_VAL     = 100        # DIV2K val set size
 
 # ── training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE  = 4          # safe for T4 at 128×128; lower to 4 if OOM
-EPOCHS      = 20
+EPOCHS      = 40         # Extended for better convergence
 LR          = 1e-4
 GRAD_CLIP   = 1.0
 
 # ── loss weights (λ1 image, λ2 watermark, λ3 perceptual placeholder) ─────────
-LAMBDA_IMG  = 1.0
-LAMBDA_WM   = 5.0        # slightly upweight watermark recovery
-LAMBDA_PERC = 0.0        # set > 0 after initial training stabilises
+LAMBDA_IMG  = 1.5
+LAMBDA_WM   = 6.5         # slightly upweight watermark recovery
+LAMBDA_PERC = 0.02        # set > 0 after initial training stabilises
 
 # ── model dims (compact Transformer) ────────────────────────────────────────
 EMBED_DIM   = 128         # patch embedding channels
@@ -53,6 +53,69 @@ OUT_DIR = '/kaggle/working/outputs'
 os.makedirs(OUT_DIR, exist_ok=True)
 print('Config loaded.')
 
+class PatchEmbed(nn.Module):
+    """Split image into non-overlapping patches and project to embed_dim."""
+
+    def __init__(self, img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_ch=3, embed_dim=EMBED_DIM):
+        super().__init__()
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        # x: (B, C, H, W)  →  (B, N, embed_dim)
+        x = self.proj(x)               # (B, embed_dim, H/P, W/P)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (B, N, C)
+        return x, H, W
+
+
+class TransformerBlock(nn.Module):
+    """Standard pre-norm Transformer block with GELU MLP."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=2.0, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn  = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden     = int(dim * mlp_ratio)
+        self.mlp   = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # Self-attention with residual
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h)
+        x = x + h
+        # MLP with residual
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class PatchUnembed(nn.Module):
+    def __init__(self, embed_dim=EMBED_DIM, patch_size=PATCH_SIZE, out_ch=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, embed_dim // 2, 3, padding=1),
+            nn.GELU(),
+            nn.ConvTranspose2d(embed_dim // 2, out_ch,
+                               kernel_size=patch_size, stride=patch_size),
+        )
+        # Original safe init — small normal weights
+        for m in self.proj:
+            if isinstance(m, nn.ConvTranspose2d):
+                nn.init.normal_(m.weight, std=0.02)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x = x.transpose(1, 2).reshape(B, C, H, W)
+        return self.proj(x)
 class WatermarkDataset(Dataset):
     """Returns (image_tensor, random_binary_watermark) pairs."""
 
@@ -103,126 +166,6 @@ val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
 
 print(f'Train: {len(train_ds)} images · Val: {len(val_ds)} images')
 print(f'Train batches: {len(train_loader)} · Val batches: {len(val_loader)}')
-
-class PatchEmbed(nn.Module):
-    """Split image into non-overlapping patches and project to embed_dim."""
-
-    def __init__(self, img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_ch=3, embed_dim=EMBED_DIM):
-        super().__init__()
-        self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x):
-        # x: (B, C, H, W)  →  (B, N, embed_dim)
-        x = self.proj(x)               # (B, embed_dim, H/P, W/P)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, N, C)
-        return x, H, W
-
-
-class TransformerBlock(nn.Module):
-    """Standard pre-norm Transformer block with GELU MLP."""
-
-    def __init__(self, dim, num_heads, mlp_ratio=2.0, dropout=0.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn  = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        hidden     = int(dim * mlp_ratio)
-        self.mlp   = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        # Self-attention with residual
-        h = self.norm1(x)
-        h, _ = self.attn(h, h, h)
-        x = x + h
-        # MLP with residual
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class PatchUnembed(nn.Module):
-    """Reshape token sequence back to spatial feature map."""
-
-    def __init__(self, embed_dim=EMBED_DIM, patch_size=PATCH_SIZE, out_ch=3):
-        super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Sequential(
-            nn.ConvTranspose2d(embed_dim, embed_dim // 2, 3, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(embed_dim // 2, out_ch,
-                               kernel_size=patch_size, stride=patch_size),
-        )
-
-    def forward(self, x, H, W):
-        # x: (B, N, C) → (B, C, H*P, W*P)
-        B, N, C = x.shape
-        x = x.transpose(1, 2).reshape(B, C, H, W)
-        return self.proj(x)  # (B, out_ch, img_size, img_size)
-
-
-class WatermarkEmbedder(nn.Module):
-    """
-    Takes (image, watermark_bits) and returns watermarked_image.
-
-    1. Patch-embed the image  →  token sequence
-    2. Expand & inject the watermark bits as a learned offset
-    3. Run Transformer blocks
-    4. Reconstruct the spatial image via PatchUnembed
-    5. Add residual from original image for imperceptibility
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.patch_embed   = PatchEmbed()
-        num_patches        = self.patch_embed.num_patches
-
-        # Project watermark bits to per-token injection vector
-        self.wm_proj    = nn.Linear(WATERMARK_BITS, EMBED_DIM)
-        self.cross_attn = nn.MultiheadAttention(EMBED_DIM, NUM_HEADS, batch_first=True)
-        self.cross_norm = nn.LayerNorm(EMBED_DIM)
-
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, EMBED_DIM))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-        self.blocks      = nn.ModuleList([
-            TransformerBlock(EMBED_DIM, NUM_HEADS, MLP_RATIO) for _ in range(DEPTH)
-        ])
-        self.norm        = nn.LayerNorm(EMBED_DIM)
-        self.patch_unembed = PatchUnembed(out_ch=3)
-        self.out_act     = nn.Tanh()  # small residual in [-1, 1]
-
-
-        ###############################################################
-        self.residual_scale = nn.Parameter(torch.tensor(0.3))  # starts at 0.3, learned
-        ###############################################################
-
-    def forward(self, img, wm):
-        # img: (B, 3, H, W) · wm: (B, bits)
-        tokens, H, W = self.patch_embed(img)        # (B, N, C)
-        tokens = tokens + self.pos_embed
-
-        # Broadcast watermark to every token
-        # In WatermarkEmbedder.forward():
-        wm_key = self.wm_proj(wm).unsqueeze(1)   # (B, 1, C) — watermark as key/value
-        for blk in self.blocks:
-            # Cross-attend: tokens query the watermark
-            attended, _ = self.cross_attn(tokens, wm_key, wm_key)
-            tokens = self.cross_norm(tokens + attended)
-            tokens = blk(tokens)
-
-        residual    = self.out_act(self.patch_unembed(tokens, H, W))
-        watermarked = torch.clamp(img + self.residual_scale.clamp(0.15, 0.40) * residual, 0.0, 1.0)
-        return watermarked
-
-
-print('Embedder defined.')
 
 class WatermarkExtractor(nn.Module):
     """
@@ -278,6 +221,63 @@ class WatermarkExtractor(nn.Module):
 
 print('Extractor defined.')
 
+class WatermarkEmbedder(nn.Module):
+    """
+    Takes (image, watermark_bits) and returns watermarked_image.
+
+    1. Patch-embed the image  →  token sequence
+    2. Expand & inject the watermark bits as a learned offset
+    3. Run Transformer blocks
+    4. Reconstruct the spatial image via PatchUnembed
+    5. Add residual from original image for imperceptibility
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.patch_embed   = PatchEmbed()
+        num_patches        = self.patch_embed.num_patches
+
+        # Project watermark bits to per-token injection vector
+        self.wm_proj    = nn.Linear(WATERMARK_BITS, EMBED_DIM)
+        self.cross_attn = nn.MultiheadAttention(EMBED_DIM, NUM_HEADS, batch_first=True)
+        self.cross_norm = nn.LayerNorm(EMBED_DIM)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, EMBED_DIM))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        self.blocks      = nn.ModuleList([
+            TransformerBlock(EMBED_DIM, NUM_HEADS, MLP_RATIO) for _ in range(DEPTH)
+        ])
+        self.norm        = nn.LayerNorm(EMBED_DIM)
+        self.patch_unembed = PatchUnembed(out_ch=3)
+        self.out_act     = nn.Tanh()  # small residual in [-1, 1]
+
+
+        ###############################################################
+        self.residual_scale = nn.Parameter(torch.tensor(0.15))  # starts at 0.3, learned
+        ###############################################################
+
+    def forward(self, img, wm):
+        # img: (B, 3, H, W) · wm: (B, bits)
+        tokens, H, W = self.patch_embed(img)        # (B, N, C)
+        tokens = tokens + self.pos_embed
+
+        # Broadcast watermark to every token
+        # In WatermarkEmbedder.forward():
+        wm_key = self.wm_proj(wm).unsqueeze(1)   # (B, 1, C) — watermark as key/value
+        for blk in self.blocks:
+            # Cross-attend: tokens query the watermark
+            attended, _ = self.cross_attn(tokens, wm_key, wm_key)
+            tokens = self.cross_norm(tokens + attended)
+            tokens = blk(tokens)
+
+        residual    = self.out_act(self.patch_unembed(tokens, H, W))
+        watermarked = torch.clamp(img + self.residual_scale.clamp(0.15, 0.40) * residual, 0.0, 1.0)
+        return watermarked
+
+
+print('Embedder defined.')
+
 class AttackLayer(nn.Module):
     """
     Randomly applies one of: Gaussian noise · JPEG-approx blur ·
@@ -329,7 +329,7 @@ print('AttackLayer defined.')
 
 embedder  = WatermarkEmbedder().to(DEVICE)
 extractor = WatermarkExtractor().to(DEVICE)
-attack    = AttackLayer(p=0.8).to(DEVICE)
+attack    = AttackLayer(p=0.0).to(DEVICE)
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -346,13 +346,16 @@ bce_loss = nn.BCEWithLogitsLoss()
 def total_loss(orig, watermarked, wm_true, wm_logits):
     l_img = mse_loss(watermarked, orig)
     l_wm  = bce_loss(wm_logits, wm_true)
+    # l_perc = perceptual_loss(orig, watermarked)
 
     # Target: keep PSNR above ~33 dB (MSE ~ 0.0005)
     # Penalise only when MSE exceeds the target — don't reward going lower
     MSE_TARGET = 0.0005
     l_img_penalty = torch.clamp(l_img / MSE_TARGET - 1.0, min=0.0)
-
+    # After image quality
+    # loss = LAMBDA_IMG * l_img_penalty + LAMBDA_WM * l_wm + LAMBDA_PERC * l_perc
     loss = LAMBDA_IMG * l_img_penalty + LAMBDA_WM * l_wm
+    
     return loss, l_img.item(), l_wm.item()
 
 
@@ -403,6 +406,21 @@ scaler    = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
 history = {'train_loss': [], 'val_loss': [], 'psnr': [],
            'ssim': [], 'ber': [], 'acc': []}
 
+# Quick loss scale check — run after Section 5:
+imgs, wms = next(iter(train_loader))
+imgs, wms = imgs.to(DEVICE), wms.to(DEVICE)
+with torch.no_grad():
+    with torch.amp.autocast('cuda', enabled=(DEVICE.type == 'cuda')):
+        watermarked = embedder(imgs, wms)
+        wm_logits   = extractor(watermarked)
+        loss, li, lw = total_loss(imgs, watermarked, wms, wm_logits)
+        print(f'Loss  : {loss.item():.4f}')
+        print(f'img   : {li:.6f}')
+        print(f'wm    : {lw:.4f}')
+        print(f'Expected total ~3.5 if LAMBDA_WM=5.0')
+history = {'train_loss': [], 'val_loss': [], 'psnr': [],
+           'ssim': [], 'ber': [], 'acc': []}
+
 
 def train_epoch(epoch):
     embedder.train(); extractor.train(); attack.train()
@@ -412,7 +430,7 @@ def train_epoch(epoch):
         imgs, wms = imgs.to(DEVICE), wms.to(DEVICE)
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+        with torch.amp.autocast('cuda', enabled=(DEVICE.type == 'cuda')):
             watermarked = embedder(imgs, wms)
             attacked    = attack(watermarked)
             wm_logits   = extractor(attacked)
@@ -440,7 +458,7 @@ def val_epoch():
     for imgs, wms in val_loader:
         imgs, wms = imgs.to(DEVICE), wms.to(DEVICE)
 
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == 'cuda')):
+        with torch.amp.autocast('cuda', enabled=(DEVICE.type == 'cuda')):
             watermarked = embedder(imgs, wms)
             wm_logits   = extractor(watermarked)   # no attack at val time
             loss, _, _  = total_loss(imgs, watermarked, wms, wm_logits)
@@ -457,41 +475,49 @@ def val_epoch():
 
 print('Train/val loops defined.')
 
-# UPDATED Section 7:
-PHASE1_EPOCHS = 10  # Increased to give embedder more pure training time
-best_val_loss = float('inf')
+embedder.train()
+imgs, wms = next(iter(train_loader))
+imgs, wms = imgs.to(DEVICE), wms.to(DEVICE)
+with torch.no_grad():
+    out = embedder(imgs, wms)
+    diff = (out - imgs).abs()
+    print(f'PSNR        : {10 * math.log10(1.0 / diff.pow(2).mean().item()):.2f} dB')
+    print(f'Mean diff   : {diff.mean().item():.6f}')
+    print(f'Scale value : {embedder.residual_scale}')   # plain float, no .item()
+    print(f'Has out_proj: {hasattr(embedder, "out_proj")}')
+    print(f'Has out_act : {hasattr(embedder, "out_act")}')
+
+
+# TRAINING
+PHASE1_EPOCHS = 10
+best_ber = float('inf')
 
 for epoch in range(1, EPOCHS + 1):
 
-    # ── Phase control ────────────────────────────────────────────
     if epoch <= PHASE1_EPOCHS:
         for p in embedder.parameters():
             p.requires_grad = True
         for p in extractor.parameters():
             p.requires_grad = False
+
         if epoch == 1:
             print('>>> Phase 1: embedder-only training (extractor frozen)')
+
     else:
         for p in embedder.parameters():
             p.requires_grad = True
         for p in extractor.parameters():
             p.requires_grad = True
+
         if epoch == PHASE1_EPOCHS + 1:
             print('>>> Phase 2: joint training (all unfrozen)')
 
-    # ── Phase control ────────────────────────────────────────────
-    if epoch <= PHASE1_EPOCHS:
-        active_params = list(embedder.parameters())
-    else:
-        active_params = list(embedder.parameters()) + list(extractor.parameters())
-    # Keep the optimizer defined once above. Frozen params stay in the optimizer,
-    # but they do not receive gradients when requires_grad=False.
-
-    # ── Train & validate ─────────────────────────────────────────
     t0 = time.time()
-    attack.current_epoch = epoch        # ← ADD THIS LINE HERE
+    attack.current_epoch = epoch
+
     tr_loss, tr_img, tr_wm = train_epoch(epoch)
     vl_loss, vl_psnr, vl_ssim, vl_ber, vl_acc = val_epoch()
+
     scheduler.step()
 
     history['train_loss'].append(tr_loss)
@@ -510,23 +536,29 @@ for epoch in range(1, EPOCHS + 1):
           f'SSIM={vl_ssim:.4f}  BER={vl_ber:.4f}  '
           f'Acc={vl_acc:.4f}  LR={lr_now:.2e}  {elapsed:.1f}s')
 
-    if vl_loss < best_val_loss:
-        best_val_loss = vl_loss
-        torch.save({'embedder':  embedder.state_dict(),
-                    'extractor': extractor.state_dict(),
-                    'epoch':     epoch},
-                   f'{OUT_DIR}/best_model.pth')
-        print(f'  ↳ best model saved (val_loss={vl_loss:.4f})')
+    if vl_ber < best_ber:
+        best_ber = vl_ber
+        torch.save({
+            "embedder": embedder.state_dict(),
+            "extractor": extractor.state_dict(),
+            "epoch": epoch,
+            "val_loss": vl_loss,
+            "psnr": vl_psnr,
+            "ssim": vl_ssim,
+            "ber": vl_ber,
+            "acc": vl_acc,
+        }, f"{OUT_DIR}/best_model_ber.pth")
+        print(f"  ↳ best BER model saved (BER={vl_ber:.4f}, Acc={vl_acc:.4f})")
 
 print('\nTraining complete.')
-print(f'Accuracy = {(1 - vl_ber) * 100:.2f}%')
+print(f'Accuracy = {(1 - best_ber) * 100:.2f}%')
 
 # ── Fine-tune from best checkpoint ───────────────────────────────────────────
-FINETUNE_EPOCHS = 10
-FINETUNE_LR     = 4e-5   # warm restart — higher than where cosine left off
+FINETUNE_EPOCHS = 15
+FINETUNE_LR     = 5e-5   # warm restart — higher than where cosine left off
 
 # Load best checkpoint
-ckpt = torch.load(f'{OUT_DIR}/best_model.pth', map_location=DEVICE)
+ckpt = torch.load(f'{OUT_DIR}/best_model_ber.pth', map_location=DEVICE)
 embedder.load_state_dict(ckpt['embedder'])
 extractor.load_state_dict(ckpt['extractor'])
 print(f'Loaded best checkpoint from epoch {ckpt["epoch"]}')
@@ -573,7 +605,7 @@ print(f'\nFine-tuning complete.')
 print(f'Final BER: {vl_ber:.4f}  |  Accuracy: {(1-vl_ber)*100:.2f}%')
 
 # Second fine-tune — load best fine-tuned model
-FINETUNE2_EPOCHS = 5
+FINETUNE2_EPOCHS = 10
 FINETUNE2_LR     = 2e-5   # lower than first fine-tune
 
 ckpt = torch.load(f'{OUT_DIR}/best_model_ft.pth', map_location=DEVICE)
@@ -597,7 +629,6 @@ for epoch in range(1, FINETUNE2_EPOCHS + 1):
     t0 = time.time()
     tr_loss, tr_img, tr_wm = train_epoch(epoch)
     vl_loss, vl_psnr, vl_ssim, vl_ber, vl_acc = val_epoch()
-    optimizer.step()
     scheduler.step()
 
     elapsed = time.time() - t0
@@ -765,4 +796,7 @@ print(f'  PSNR     : {history["psnr"][best]:.2f} dB  (target > 30 dB)')
 print(f'  SSIM     : {history["ssim"][best]:.4f}     (target > 0.90)')
 print(f'  BER      : {history["ber"][best]:.4f}      (target < 0.10)')
 print(f'  Acc      : {history["acc"][best]:.4f}      (target > 0.90)')
+
+
+
 
